@@ -54,25 +54,18 @@ async def get_analysis_handler(
     db_session: AsyncSession = Depends(get_db),
     mongo_db: AsyncIOMotorDatabase = Depends(get_mongo_db),
 ):
-    try:
-        if ObjectId.is_valid(analysis_id):
-            data = await get_analysis_mongo(mongo_db, user_id, analysis_id)
-            data["analysis_type"] = "structured"
-        else:
-            data = await get_analysis(db_session, user_id, int(analysis_id))
-            data["analysis_type"] = "markdown"
-
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    
-    if data is None:
-            raise HTTPException(status_code=404, detail="Whoops! Looks like we couldn't find that analysis.")
-    
-    return data
-
-
-@router.post("/secure_route")
-async def secure_route_handler(email: str = Depends(cookie_verification), db_session: AsyncSession = Depends(get_db)) -> User:
-    user = await get_user(db_session, email)
-    logger.info("User retrieved for secure route.", extra={"user_id": user.userid})
-    return user
+    data = await get_analysis(db_session, user_id, analysis_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Whoops! Looks like we couldn't find that analysis.")
+    result = []
+    factor_name, analysis, file_name, created_at, feedback = data
+    result.append(
+        {
+            "factor_name": factor_name,
+            "analysis": analysis,
+            "file_name": file_name,
+            "created_at": created_at,
+            "feedback": feedback,
+        }
+    )
+    return result
