@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional, Union
 from app.config import MIN_ISSUE_LIMIT
 from app.services.data import Factors, char_factor_map, OWASP_GROUPS
 from app.dependencies import logger
+import json
 
 
 class PromptService:
@@ -17,6 +18,7 @@ class PromptService:
             "power_analysis_prompt": self._power_analysis_prompt,
             "power_analysis_small_prompt": self._power_analysis_small_prompt,
             "owasp_analysis_prompt": self._owasp_analysis_prompt,
+            "generate_pr_summary": self.generate_pr_summary,
         }
 
     async def get_prompt(
@@ -222,7 +224,7 @@ CRITICAL POINT : Every identified Issue must follow the structure below in attac
         return results
 
     async def _power_analysis_prompt(
-        self, factor_name: str, context: str, applicable_chars: List[str] = None, additional_instructions: str = None
+        self, factor_name: str, context: str, applicable_chars: List[str] = None, additional_instructions: str = None, pr_summary = None
     ) -> Dict[str, str]:
         """
         Generate an array of prompts for the power analysis.
@@ -251,7 +253,7 @@ CRITICAL POINT : Every identified Issue must follow the structure below in attac
                 filtered_char_objects.append(additional_characteristic)
 
             results = await self._process_power_analysis_factor(
-                factor_name, context, filtered_char_objects
+                factor_name, context, filtered_char_objects, pr_summary
             )
 
             for characteristic, prompt in results:
@@ -274,7 +276,7 @@ CRITICAL POINT : Every identified Issue must follow the structure below in attac
         }
 
     async def _process_power_analysis_factor(
-        self, factor_name: str, context: str, char_objects: List[Dict[str, Any]]
+        self, factor_name: str, context: str, char_objects: List[Dict[str, Any]], pr_summary=None
     ) -> List[tuple]:
         """
         Process a list of characteristics to generate prompts.
@@ -291,9 +293,16 @@ CRITICAL POINT : Every identified Issue must follow the structure below in attac
             example = obj["example"]
             weight = obj["weight"]
 
+            # Add PR summary line if available
+            pr_line = (
+                f"\n\nAlso, Here is a concise summary of the PR, providing context for the file (which is part of this PR) that you are going to analyze: \n{pr_summary}\n"
+                if pr_summary
+                else ""
+            )
+
             # Generate the prompt for each factor object
             prompt_template = f"""
-Consider yourself a senior software engineer. Perform a detailed code analysis on the above given code, focusing on {characteristic}. {description}
+Consider yourself a senior software engineer. Perform a detailed code analysis on the above given code, focusing on {characteristic}. {description}. {pr_line}
 
 ### **Analysis Guidelines:**
 
@@ -447,7 +456,7 @@ Focusing on identifying maximum {issue_limit} key issues related to readability,
         return results
 
     async def _owasp_analysis_prompt(
-        self, factor_name: str, context: str, applicable_chars: List[str] = None
+        self, factor_name: str, context: str, applicable_chars: List[str] = None, pr_summary = None
     ) -> Dict[str, str]:
         """
         Generate an array of prompts for the owasp analysis.
@@ -479,7 +488,7 @@ Focusing on identifying maximum {issue_limit} key issues related to readability,
 
         for group_name, char_list in grouped_characteristics.items():
             results = await self._process_owasp_analysis_factor(
-                factor_name, char_list, group_name, context
+                factor_name, char_list, group_name, context, pr_summary
             )
             prompt_dict[group_name] = results
 
@@ -491,6 +500,7 @@ Focusing on identifying maximum {issue_limit} key issues related to readability,
         char_objects: List[Dict[str, Any]],
         group_name: str,
         context: str = "",
+        pr_summary = None
     ) -> str:
         """
         Process a list of characteristics within a specific OWASP group.
@@ -510,12 +520,21 @@ Focusing on identifying maximum {issue_limit} key issues related to readability,
             else ""
         )
 
+        # Add PR summary line if available
+        pr_line = (
+            f"\n\nHere is a concise summary of the PR, providing context for the file (which is part of this PR) that you are going to analyze: \n{pr_summary}\n"
+            if pr_summary
+            else ""
+        )
+
         # Construct a single prompt for the entire group
         prompt_template = f"""
 Consider yourself a senior security engineer capable of performing security analysis. 
 Your task is to analyze the provided code for vulnerabilities related to the following OWASP risks:
 
 {', '.join(characteristics_list)}
+
+{pr_line}
 
 ### **Input Structure:**  
 1. **Code:** The provided code to analyze.
@@ -547,3 +566,79 @@ Your task is to analyze the provided code for vulnerabilities related to the fol
 (Improved code snippet resolving the issue.)  
 """
         return prompt_template
+
+    async def generate_pr_summary(self, pr_full_data: Dict[str, Any], pr_file_details: List[Dict[str, Any]]) -> str:
+        """
+        Generates a PR summary using AI by combining high-level PR metadata and file-level changes.
+        """
+
+        # --- Step 1: Extract high-level info ---
+        title = pr_full_data.get("title", "")
+        description = pr_full_data.get("body", "")  # GitHub API uses 'body' not 'description'
+        author = pr_full_data.get("user", {}).get("login", "unknown")
+        labels = [label.get("name", "") for label in pr_full_data.get("labels", [])]
+        commits = [commit.get("commit", {}).get("message", "") for commit in pr_full_data.get("commits", [])]
+
+        # --- Step 2: Extract file-level info ---
+        file_summaries = []
+        for f in pr_file_details:
+            file_summary = {
+                "filename": f.get("filename", ""),
+                "status": f.get("status", ""),
+                "additions": f.get("additions", 0),
+                "deletions": f.get("deletions", 0),
+                "changes": f.get("changes", 0),
+                "patch": f.get("patch", "")
+            }
+            file_summaries.append(file_summary)
+
+        # --- Step 3: Build prompt for AI ---
+        prompt = f"""
+    You are an expert code reviewer. Summarize the Pull Request in a **concise, generic, and high-level way** so that it’s easy for any reviewer to quickly understand the overall impact.
+
+    ### PR Metadata
+    - **Title:** {title}
+    - **Description:** {description}
+    - **Author:** {author}
+    - **Labels:** {', '.join(labels) if labels else 'None'}
+    - **Commits:** {len(commits)} commits
+    {chr(20).join([f"  - {msg}" for msg in commits])}
+
+    ### File Changes (metadata + patch for context)
+    {json.dumps(file_summaries, indent=2)}
+
+    ---
+
+    ### Response Format
+    ## PR Summary
+    - Provide a **broad overview** of what this PR does (new features, fixes, refactors, optimizations, etc.).  
+    - Focus on the **overall purpose and impact** rather than file-by-file details.  
+    - Highlight any potential implications of the changes, such as improvements to performance, security, or the user experience, if applicable.  
+    - Keep the explanation **objective, clear, and limited to 3–4 lines maximum**.
+
+    ## File-wise Changes
+    Provide a table that explains **what changed in each file and why**, along with the **impact** of those changes.  
+    Avoid listing just line additions/removals. Instead, focus on the logic, purpose, and consequences.
+
+    | File Name   | Summary of Modifications |
+    |-------------|---------------------------------------|
+    | file1.py    | Refactored authentication logic to use token-based validation, improving security and reducing dependency on sessions. |
+    | file2.js    | Updated UI form validation to handle edge cases, enhancing user experience and reducing input errors. |
+
+    ## Optional Diagram (if meaningful)
+    If the PR introduces or modifies **important workflows, class structures, or interactions**, provide **one diagram** in **Mermaid syntax** that best illustrates the changes.  
+    - Choose the **most appropriate type** (class diagram, sequence diagram, flowchart, state diagram, etc.).  
+    - Keep the diagram **concise and limited to essential components**.  
+    - Do not include more than one diagram.  
+    - If no meaningful diagram is possible, omit this section.
+
+    ### Example (Mermaid)
+    ```mermaid
+    flowchart TD
+    User -->|submits form| UI
+    UI -->|validates input| Validator
+    Validator -->|sends request| Backend
+    Backend -->|stores data| Database
+"""
+
+        return prompt
